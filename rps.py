@@ -366,7 +366,7 @@ class RPS_AI:
         q_values = self.policy_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
         with torch.no_grad():
             next_q_values = self.target_net(next_states).max(1)[0]
-        expected_q_values =_rewards + self.gamma * next_q_values * (1 - dones)
+        expected_q_values = rewards + self.gamma * next_q_values * (1 - dones)
         
         loss = nn.MSELoss()(q_values, expected_q_values)
         
