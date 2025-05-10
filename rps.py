@@ -9,18 +9,19 @@ import time
 from collections import deque, Counter
 import random
 import os
+import pickle
 
 # Neural Network for DQN
 class DQN(nn.Module):
-    def __init__(self, input_dim, output_dim):
+    def __init__(self, input_dim, output_dim, hidden_dims=[128, 128]):
         super(DQN, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, output_dim)
-        )
+        layers = []
+        prev_dim = input_dim
+        for dim in hidden_dims:
+            layers.extend([nn.Linear(prev_dim, dim), nn.ReLU()])
+            prev_dim = dim
+        layers.append(nn.Linear(prev_dim, output_dim))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.net(x)
@@ -69,7 +70,9 @@ class GameDatabase:
                 learning_rate REAL,
                 epsilon REAL,
                 pattern_reward REAL,
-                rating TEXT
+                rating TEXT,
+                confidence REAL,
+                loss REAL
             )
         ''')
         self.conn.commit()
@@ -84,12 +87,12 @@ class GameDatabase:
         ''', (game_id, state_str, action, reward, next_state_str, int(done), rating, patterns_str))
         self.conn.commit()
 
-    def save_performance(self, game_id, win_ratio, tie_ratio, detected_patterns, learning_rate, epsilon, pattern_reward, rating):
+    def save_performance(self, game_id, win_ratio, tie_ratio, detected_patterns, learning_rate, epsilon, pattern_reward, rating, confidence, loss):
         patterns_str = ';'.join(detected_patterns)
         self.cursor.execute('''
-            INSERT INTO performance (game_id, win_ratio, tie_ratio, detected_patterns, learning_rate, epsilon, pattern_reward, rating)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (game_id, win_ratio, tie_ratio, patterns_str, learning_rate, epsilon, pattern_reward, rating))
+            INSERT INTO performance (game_id, win_ratio, tie_ratio, detected_patterns, learning_rate, epsilon, pattern_reward, rating, confidence, loss)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (game_id, win_ratio, tie_ratio, patterns_str, learning_rate, epsilon, pattern_reward, rating, confidence, loss))
         self.conn.commit()
 
     def load_transitions(self, max_games=5, min_rating="neutral"):
@@ -127,7 +130,7 @@ class GameDatabase:
 
     def load_performance(self):
         self.cursor.execute('''
-            SELECT win_ratio, tie_ratio, detected_patterns, learning_rate, epsilon, pattern_reward, rating
+            SELECT win_ratio, tie_ratio, detected_patterns, learning_rate, epsilon, pattern_reward, rating, confidence, loss
             FROM performance
             WHERE rating IN ("good", "might_work", "neutral")
             ORDER BY game_id DESC LIMIT 1
@@ -141,7 +144,9 @@ class GameDatabase:
                 'detected_patterns': patterns,
                 'learning_rate': row[3],
                 'epsilon': row[4],
-                'pattern_reward': row[5]
+                'pattern_reward': row[5],
+                'confidence': row[7],
+                'loss': row[8]
             }
         return None
 
@@ -149,6 +154,10 @@ class GameDatabase:
         self.cursor.execute('SELECT tie_ratio FROM performance ORDER BY game_id DESC LIMIT ?', (max_games,))
         tie_ratios = [row[0] for row in self.cursor.fetchall()]
         return np.mean(tie_ratios) if tie_ratios else 0.2
+
+    def get_historical_performance(self, max_games=10):
+        self.cursor.execute('SELECT game_id, win_ratio, tie_ratio, confidence, loss FROM performance ORDER BY game_id DESC LIMIT ?', (max_games,))
+        return [{'game_id': row[0], 'win_ratio': row[1], 'tie_ratio': row[2], 'confidence': row[3], 'loss': row[4]} for row in self.cursor.fetchall()]
 
     def update_transition_rating(self, game_id, transition_id, new_rating):
         self.cursor.execute('UPDATE games SET rating = ? WHERE game_id = ? AND id = ?', (new_rating, game_id, transition_id))
@@ -186,6 +195,105 @@ class GameDatabase:
         self.conn.commit()
         self.conn.close()
 
+# Meta-Controller for Autonomous Optimization
+class MetaController:
+    def __init__(self):
+        self.q_table = {}  # State -> Action -> Q-value
+        self.actions = [
+            ('learning_rate', 0.5), ('learning_rate', 2.0),
+            ('epsilon', 0.5), ('epsilon', 2.0),
+            ('pattern_reward', 0.5), ('pattern_reward', 2.0),
+            ('memory_capacity', 0.5), ('memory_capacity', 2.0),
+            ('batch_size', 0.5), ('batch_size', 2.0),
+            ('confidence_threshold', 0.9), ('confidence_threshold', 1.1),
+            ('hidden_dims', [128, 128]), ('hidden_dims', [256, 256]),
+            ('action_weights', {'random': 0.3, 'pattern': 0.5, 'dqn': 0.2}),
+            ('action_weights', {'random': 0.2, 'pattern': 0.6, 'dqn': 0.2})
+        ]
+        self.stable_config = None
+        self.stable_performance = 0.0
+        self.experiment_game_count = 0
+        self.experiment_config = None
+        self.alpha = 0.1  # Learning rate
+        self.gamma = 0.9  # Discount factor
+        self.epsilon = 0.2  # Exploration rate
+        self.q_table_file = "meta_q_table.pkl"
+        self.load_q_table()
+
+    def discretize_state(self, performance):
+        return (
+            int(performance['win_ratio'] * 10) / 10,
+            int(performance['tie_ratio'] * 10) / 10,
+            int(performance['confidence'] * 10) / 10,
+            int(performance['loss'] * 10) / 10
+        )
+
+    def get_action(self, state):
+        if random.random() < self.epsilon:
+            return random.choice(self.actions)
+        state_key = str(state)
+        if state_key not in self.q_table:
+            self.q_table[state_key] = {str(a): 0.0 for a in self.actions}
+        q_values = self.q_table[state_key]
+        max_q = max(q_values.values())
+        best_actions = [a for a, q in q_values.items() if q == max_q]
+        return random.choice([eval(a) if isinstance(a, str) else a for a in best_actions])
+
+    def update_q_table(self, state, action, reward, next_state):
+        state_key = str(state)
+        action_key = str(action)
+        next_state_key = str(next_state)
+        if state_key not in self.q_table:
+            self.q_table[state_key] = {str(a): 0.0 for a in self.actions}
+        if next_state_key not in self.q_table:
+            self.q_table[next_state_key] = {str(a): 0.0 for a in self.actions}
+        current_q = self.q_table[state_key][action_key]
+        next_max_q = max(self.q_table[next_state_key].values())
+        new_q = current_q + self.alpha * (reward + self.gamma * next_max_q - current_q)
+        self.q_table[state_key][action_key] = new_q
+        self.save_q_table()
+
+    def save_q_table(self):
+        with open(self.q_table_file, 'wb') as f:
+            pickle.dump(self.q_table, f)
+
+    def load_q_table(self):
+        if os.path.exists(self.q_table_file):
+            with open(self.q_table_file, 'rb') as f:
+                self.q_table = pickle.load(f)
+
+    def evaluate_performance(self, performance):
+        reward = performance['win_ratio'] - 2 * performance['tie_ratio'] + 0.5 * performance['confidence'] - 0.5 * performance['loss']
+        return max(-1.0, min(1.0, reward))
+
+    def apply_config(self, config, rps_ai):
+        param, value = config
+        if param == 'learning_rate':
+            rps_ai.learning_rate = max(0.0001, min(0.01, rps_ai.learning_rate * value))
+            rps_ai.optimizer = optim.Adam(rps_ai.policy_net.parameters(), lr=rps_ai.learning_rate)
+        elif param == 'epsilon':
+            rps_ai.epsilon = max(0.01, min(0.5, rps_ai.epsilon * value))
+        elif param == 'pattern_reward':
+            rps_ai.pattern_reward = max(0.5, min(10.0, rps_ai.pattern_reward * value))
+        elif param == 'memory_capacity':
+            new_capacity = max(1000, min(10000, int(rps_ai.memory.capacity * value)))
+            rps_ai.memory = ReplayMemory(new_capacity)
+            for transition in rps_ai.db.load_transitions(min_rating="might_work"):
+                rps_ai.memory.push(*transition)
+        elif param == 'batch_size':
+            rps_ai.batch_size = max(32, min(256, int(rps_ai.batch_size * value)))
+        elif param == 'confidence_threshold':
+            rps_ai.confidence_threshold = max(0.3, min(0.7, rps_ai.confidence_threshold * value))
+        elif param == 'hidden_dims':
+            rps_ai.policy_net = DQN(rps_ai.state_dim, rps_ai.action_dim, value).to(rps_ai.device)
+            rps_ai.target_net = DQN(rps_ai.state_dim, rps_ai.action_dim, value).to(rps_ai.device)
+            rps_ai.target_net.load_state_dict(rps_ai.policy_net.state_dict())
+            rps_ai.target_net.eval()
+            rps_ai.optimizer = optim.Adam(rps_ai.policy_net.parameters(), lr=rps_ai.learning_rate)
+            rps_ai.load_model()  # Try to load compatible weights
+        elif param == 'action_weights':
+            rps_ai.action_weights = value
+
 # Rock Paper Scissors AI
 class RPS_AI:
     def __init__(self, state_dim=30, action_dim=3, memory_capacity=3000, batch_size=64):
@@ -195,6 +303,7 @@ class RPS_AI:
         self.batch_size = batch_size
         self.memory = ReplayMemory(memory_capacity)
         self.db = GameDatabase()
+        self.meta_controller = MetaController()
         
         self.policy_net = DQN(state_dim, action_dim).to(self.device)
         self.target_net = DQN(state_dim, action_dim).to(self.device)
@@ -206,6 +315,8 @@ class RPS_AI:
         self.learning_rate = perf['learning_rate'] if perf else 0.001
         self.epsilon = perf['epsilon'] if perf else 0.2
         self.pattern_reward = perf['pattern_reward'] if perf else 3.0
+        self.confidence = perf['confidence'] if perf else 0.0
+        self.loss = perf['loss'] if perf else 0.0
         
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.learning_rate)
         self.gamma = 0.99
@@ -218,6 +329,8 @@ class RPS_AI:
         self.pattern_confidence_history = deque(maxlen=5)
         self.loss_history = deque(maxlen=10)
         self.pattern_counts = Counter()
+        self.confidence_threshold = 0.5
+        self.action_weights = {'random': 0.2, 'pattern': 0.6, 'dqn': 0.2}
         
         for transition in self.db.load_transitions():
             self.memory.push(*transition)
@@ -238,8 +351,11 @@ class RPS_AI:
 
     def load_model(self, path="rps_model.pth"):
         if os.path.exists(path):
-            self.policy_net.load_state_dict(torch.load(path))
-            self.target_net.load_state_dict(self.policy_net.state_dict())
+            try:
+                self.policy_net.load_state_dict(torch.load(path))
+                self.target_net.load_state_dict(self.policy_net.state_dict())
+            except RuntimeError:
+                print("Warning: Incompatible model weights; initializing new model")
 
     def get_state(self):
         state = np.zeros(self.state_dim)
@@ -300,11 +416,14 @@ class RPS_AI:
 
     def choose_action(self, state, predicted_move, confidence):
         self.steps += 1
-        if np.random.rand() < self.epsilon:
+        weights = self.action_weights
+        choice = random.choices(['random', 'pattern', 'dqn'], weights=[weights['random'], weights['pattern'], weights['dqn']], k=1)[0]
+        
+        if choice == 'random' or np.random.rand() < self.epsilon:
             action = np.random.randint(self.action_dim)
             print(f"Action: Random ({self.reverse_map[action]})")
             return action
-        if predicted_move and confidence >= 0.5:
+        if choice == 'pattern' and predicted_move and confidence >= self.confidence_threshold:
             if predicted_move == 'r':
                 action = self.move_map['p']
             elif predicted_move == 'p':
@@ -314,7 +433,7 @@ class RPS_AI:
             print(f"Action: Pattern-based ({self.reverse_map[action]})")
             return action
         human_moves = [hm for hm, _ in list(self.history)[-6:]]
-        if human_moves:
+        if human_moves and choice != 'dqn':
             move_counts = Counter(human_moves)
             most_common = move_counts.most_common(1)[0][0]
             if most_common == 'r':
@@ -355,6 +474,8 @@ class RPS_AI:
         
         predicted_move, self.pattern_confidence = self.predict_next_move(human_moves)
         self.pattern_confidence_history.append(self.pattern_confidence)
+        self.confidence = self.pattern_confidence
+        self.loss = np.mean(self.loss_history) if self.loss_history else 0.0
         
         rating = "good" if win_ratio >= 0.7 and tie_ratio <= 0.2 else "neutral" if tie_ratio <= 0.3 else "bad"
         self.db.save_performance(
@@ -365,7 +486,9 @@ class RPS_AI:
             learning_rate=self.learning_rate,
             epsilon=self.epsilon,
             pattern_reward=self.pattern_reward,
-            rating=rating
+            rating=rating,
+            confidence=self.confidence,
+            loss=self.loss
         )
         
         if rating == "good" and detected_patterns:
@@ -376,6 +499,9 @@ class RPS_AI:
             print(f"Detected patterns: {', '.join(detected_patterns)}")
         if predicted_move:
             print(f"Predicted next human move: {predicted_move} (confidence: {self.pattern_confidence:.2f})")
+        
+        performance = {'win_ratio': win_ratio, 'tie_ratio': tie_ratio, 'confidence': self.confidence, 'loss': self.loss}
+        self.meta_controller.experiment_game_count += 1
         
         historical_tie_ratio = self.db.get_historical_tie_ratio()
         tie_threshold = max(0.15, historical_tie_ratio * 1.1)
@@ -393,14 +519,66 @@ class RPS_AI:
             (1 if high_loss else 0)
         )
         
-        if stagnation_score >= 2:
-            print(f"Stagnation detected (score: {stagnation_score}/5, tie_ratio: {tie_ratio:.2f}/{tie_threshold:.2f}, win_ratio: {win_ratio:.2f}/{win_threshold:.2f}, confidence: {max(self.pattern_confidence_history or [0]):.2f}/{confidence_threshold:.2f}, pattern_stagnation: {pattern_stagnation}, high_loss: {high_loss})")
-            self.adjust_parameters(tie_ratio, win_ratio, patterns, is_stagnant=True, stagnation_score=stagnation_score)
-        else:
-            self.adjust_parameters(tie_ratio, win_ratio, patterns, is_stagnant=False, stagnation_score=stagnation_score)
+        state = self.meta_controller.discretize_state(performance)
+        reward = self.meta_controller.evaluate_performance(performance)
+        
+        if self.meta_controller.experiment_config:
+            next_state = state
+            self.meta_controller.update_q_table(self.meta_controller.experiment_state, self.meta_controller.experiment_config, reward, next_state)
+        
+        if stagnation_score >= 2 or self.meta_controller.experiment_game_count >= 2:
+            print(f"Meta-Controller: Evaluating performance (stagnation_score: {stagnation_score}/5, reward: {reward:.2f})")
+            if reward > self.meta_controller.stable_performance:
+                self.meta_controller.stable_config = {
+                    'learning_rate': self.learning_rate,
+                    'epsilon': self.epsilon,
+                    'pattern_reward': self.pattern_reward,
+                    'memory_capacity': self.memory.capacity,
+                    'batch_size': self.batch_size,
+                    'confidence_threshold': self.confidence_threshold,
+                    'hidden_dims': [layer.out_features for layer in self.policy_net.net if isinstance(layer, nn.Linear)][:-1],
+                    'action_weights': self.action_weights
+                }
+                self.meta_controller.stable_performance = reward
+                print(f"Meta-Controller: Updated stable configuration (reward: {reward:.2f})")
+            
+            if stagnation_score >= 2 or reward < 0.5:
+                action = self.meta_controller.get_action(state)
+                self.meta_controller.apply_config(action, self)
+                self.meta_controller.experiment_config = action
+                self.meta_controller.experiment_state = state
+                self.meta_controller.experiment_game_count = 0
+                print(f"Meta-Controller: Applying new configuration: {action}")
+            elif reward < self.meta_controller.stable_performance - 0.1 and self.meta_controller.stable_config:
+                for key, value in self.meta_controller.stable_config.items():
+                    if key == 'learning_rate':
+                        self.learning_rate = value
+                        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.learning_rate)
+                    elif key == 'memory_capacity':
+                        self.memory = ReplayMemory(value)
+                        for transition in self.db.load_transitions(min_rating="might_work"):
+                            self.memory.push(*transition)
+                    elif key == 'hidden_dims':
+                        self.policy_net = DQN(self.state_dim, self.action_dim, value).to(self.device)
+                        self.target_net = DQN(self.state_dim, self.action_dim, value).to(self.device)
+                        self.target_net.load_state_dict(self.policy_net.state_dict())
+                        self.target_net.eval()
+                        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.learning_rate)
+                    else:
+                        setattr(self, key, value)
+                self.meta_controller.experiment_config = None
+                self.meta_controller.experiment_game_count = 0
+                print(f"Meta-Controller: Reverted to stable configuration (reward: {reward:.2f})")
+            else:
+                action = self.meta_controller.get_action(state)
+                self.meta_controller.apply_config(action, self)
+                self.meta_controller.experiment_config = action
+                self.meta_controller.experiment_state = state
+                self.meta_controller.experiment_game_count = 0
+                print(f"Meta-Controller: Experimenting with new configuration: {action}")
 
     def adjust_parameters(self, tie_ratio, win_ratio, patterns, is_stagnant, stagnation_score):
-        if is_stagnant:
+        if is_stagnant and not self.meta_controller.experiment_config:
             self.epsilon = min(self.epsilon * (1.5 + 0.1 * stagnation_score), 0.5)
             self.learning_rate = max(self.learning_rate * (0.8 - 0.05 * stagnation_score), 0.0001)
             self.pattern_reward = max(self.pattern_reward - (0.5 + 0.1 * stagnation_score), 0.5)
@@ -409,7 +587,7 @@ class RPS_AI:
             min_rating = "might_work" if stagnation_score < 4 else "good"
             for transition in self.db.load_transitions(min_rating=min_rating):
                 self.memory.push(*transition)
-        else:
+        elif not self.meta_controller.experiment_config:
             if patterns:
                 self.pattern_reward = min(self.pattern_reward + 3.0, 10.0)
                 self.epsilon = max(self.epsilon * 0.2, self.epsilon_min)
@@ -487,7 +665,7 @@ class RPS_AI:
             
             outcome = self.determine_winner(human_move, ai_move)
             reward = outcome
-            if predicted_move and confidence >= 0.5 and outcome == 1:
+            if predicted_move and confidence >= self.confidence_threshold and outcome == 1:
                 reward += self.pattern_reward
             
             patterns = self.detect_patterns(human_moves)
