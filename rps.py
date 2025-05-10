@@ -54,7 +54,9 @@ class GameDatabase:
                 action INTEGER,
                 reward REAL,
                 next_state TEXT,
-                done INTEGER
+                done INTEGER,
+                rating TEXT,
+                patterns TEXT
             )
         ''')
         self.cursor.execute('''
@@ -66,46 +68,70 @@ class GameDatabase:
                 detected_patterns TEXT,
                 learning_rate REAL,
                 epsilon REAL,
-                pattern_reward REAL
+                pattern_reward REAL,
+                rating TEXT
             )
         ''')
         self.conn.commit()
 
-    def save_transition(self, game_id, state, action, reward, next_state, done):
+    def save_transition(self, game_id, state, action, reward, next_state, done, rating, patterns):
         state_str = ','.join(map(str, state))
         next_state_str = ','.join(map(str, next_state))
+        patterns_str = ';'.join(patterns) if patterns else ''
         self.cursor.execute('''
-            INSERT INTO games (game_id, state, action, reward, next_state, done)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (game_id, state_str, action, reward, next_state_str, int(done)))
+            INSERT INTO games (game_id, state, action, reward, next_state, done, rating, patterns)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (game_id, state_str, action, reward, next_state_str, int(done), rating, patterns_str))
         self.conn.commit()
 
-    def save_performance(self, game_id, win_ratio, tie_ratio, detected_patterns, learning_rate, epsilon, pattern_reward):
+    def save_performance(self, game_id, win_ratio, tie_ratio, detected_patterns, learning_rate, epsilon, pattern_reward, rating):
         patterns_str = ';'.join(detected_patterns)
         self.cursor.execute('''
-            INSERT INTO performance (game_id, win_ratio, tie_ratio, detected_patterns, learning_rate, epsilon, pattern_reward)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (game_id, win_ratio, tie_ratio, patterns_str, learning_rate, epsilon, pattern_reward))
+            INSERT INTO performance (game_id, win_ratio, tie_ratio, detected_patterns, learning_rate, epsilon, pattern_reward, rating)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (game_id, win_ratio, tie_ratio, patterns_str, learning_rate, epsilon, pattern_reward, rating))
         self.conn.commit()
 
-    def load_transitions(self, max_games=3):
-        self.cursor.execute('SELECT DISTINCT game_id FROM games ORDER BY game_id DESC LIMIT ?', (max_games,))
+    def load_transitions(self, max_games=5, min_rating="neutral"):
+        self.cursor.execute('SELECT DISTINCT game_id FROM performance WHERE rating IN ("good", "might_work") ORDER BY game_id DESC LIMIT ?', (max_games,))
         game_ids = [row[0] for row in self.cursor.fetchall()]
+        if len(game_ids) < max_games:
+            self.cursor.execute('SELECT DISTINCT game_id FROM games WHERE game_id NOT IN (SELECT game_id FROM performance WHERE rating IN ("good", "might_work")) ORDER BY game_id DESC LIMIT ?', (max_games - len(game_ids),))
+            game_ids.extend([row[0] for row in self.cursor.fetchall()])
         transitions = []
         if game_ids:
             placeholders = ','.join('?' for _ in game_ids)
-            self.cursor.execute(f'SELECT state, action, reward, next_state, done FROM games WHERE game_id IN ({placeholders})', game_ids)
+            rating_priority = {"good": 4, "might_work": 3, "neutral": 2, "bad": 1}
+            min_priority = rating_priority.get(min_rating, 2)
+            self.cursor.execute(f'''
+                SELECT id, state, action, reward, next_state, done, rating, patterns
+                FROM games
+                WHERE game_id IN ({placeholders}) AND (
+                    rating = "good" OR
+                    rating = "might_work" OR
+                    rating = "neutral" OR
+                    (rating = "bad" AND ? = "bad")
+                )
+            ''', game_ids + [min_rating])
             for row in self.cursor.fetchall():
-                state = np.array([float(x) for x in row[0].split(',')])
-                action = int(row[1])
-                reward = float(row[2])
-                next_state = np.array([float(x) for x in row[3].split(',')])
-                done = bool(row[4])
-                transitions.append((state, action, reward, next_state, done))
-        return transitions
+                state = np.array([float(x) for x in row[1].split(',')])
+                action = int(row[2])
+                reward = float(row[3])
+                next_state = np.array([float(x) for x in row[4].split(',')])
+                done = bool(row[5])
+                rating = row[6]
+                weight = rating_priority.get(rating, 1)
+                transitions.extend([(state, action, reward, next_state, done)] * weight)
+        random.shuffle(transitions)
+        return transitions[:3000]
 
     def load_performance(self):
-        self.cursor.execute('SELECT win_ratio, tie_ratio, detected_patterns, learning_rate, epsilon, pattern_reward FROM performance ORDER BY game_id DESC LIMIT 1')
+        self.cursor.execute('''
+            SELECT win_ratio, tie_ratio, detected_patterns, learning_rate, epsilon, pattern_reward, rating
+            FROM performance
+            WHERE rating IN ("good", "might_work", "neutral")
+            ORDER BY game_id DESC LIMIT 1
+        ''')
         row = self.cursor.fetchone()
         if row:
             patterns = row[2].split(';') if row[2] else []
@@ -119,23 +145,45 @@ class GameDatabase:
             }
         return None
 
-    def clear_old_games(self, max_games=3):
-        self.cursor.execute('SELECT DISTINCT game_id FROM games ORDER BY game_id DESC LIMIT ?', (max_games,))
-        keep_ids = [row[0] for row in self.cursor.fetchall()]
-        if keep_ids:
-            placeholders = ','.join('?' for _ in keep_ids)
-            self.cursor.execute(f'DELETE FROM games WHERE game_id NOT IN ({placeholders})', keep_ids)
-            self.conn.commit()
+    def get_historical_tie_ratio(self, max_games=3):
+        self.cursor.execute('SELECT tie_ratio FROM performance ORDER BY game_id DESC LIMIT ?', (max_games,))
+        tie_ratios = [row[0] for row in self.cursor.fetchall()]
+        return np.mean(tie_ratios) if tie_ratios else 0.2
 
-    def reset_database(self):
-        self.conn.close()
-        if os.path.exists(self.db_name):
-            os.remove(self.db_name)
-        self.conn = sqlite3.connect(self.db_name)
-        self.cursor = self.conn.cursor()
-        self.__init__(self.db_name)
+    def update_transition_rating(self, game_id, transition_id, new_rating):
+        self.cursor.execute('UPDATE games SET rating = ? WHERE game_id = ? AND id = ?', (new_rating, game_id, transition_id))
+        self.conn.commit()
+
+    def update_performance_rating(self, game_id, new_rating):
+        self.cursor.execute('UPDATE performance SET rating = ? WHERE game_id = ?', (new_rating, game_id))
+        self.conn.commit()
+
+    def re_evaluate_bad_transitions(self, current_game_id, winning_patterns):
+        if not winning_patterns:
+            return
+        winning_patterns_set = set(winning_patterns)
+        self.cursor.execute('SELECT id, game_id, patterns, reward FROM games WHERE rating = "bad" AND game_id != ?', (current_game_id,))
+        for row in self.cursor.fetchall():
+            transition_id, game_id, patterns_str, reward = row
+            if patterns_str:
+                patterns = set(patterns_str.split(';'))
+                if patterns & winning_patterns_set and reward < 1:
+                    self.update_transition_rating(game_id, transition_id, "might_work")
+
+    def re_evaluate_bad_games(self, current_game_id, winning_patterns):
+        if not winning_patterns:
+            return
+        winning_patterns_set = set(winning_patterns)
+        self.cursor.execute('SELECT game_id, detected_patterns FROM performance WHERE rating = "bad" AND game_id != ?', (current_game_id,))
+        for row in self.cursor.fetchall():
+            game_id, patterns_str = row
+            if patterns_str:
+                patterns = set(patterns_str.split(';'))
+                if patterns & winning_patterns_set:
+                    self.update_performance_rating(game_id, "might_work")
 
     def close(self):
+        self.conn.commit()
         self.conn.close()
 
 # Rock Paper Scissors AI
@@ -148,13 +196,12 @@ class RPS_AI:
         self.memory = ReplayMemory(memory_capacity)
         self.db = GameDatabase()
         
-        # Initialize DQN models
         self.policy_net = DQN(state_dim, action_dim).to(self.device)
         self.target_net = DQN(state_dim, action_dim).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
+        self.load_model()
         
-        # Load previous performance
         perf = self.db.load_performance()
         self.learning_rate = perf['learning_rate'] if perf else 0.001
         self.epsilon = perf['epsilon'] if perf else 0.2
@@ -168,12 +215,13 @@ class RPS_AI:
         self.update_target_freq = 10
         self.game_id = 0
         self.prev_tie_ratio = 0.0
+        self.pattern_confidence_history = deque(maxlen=5)
+        self.loss_history = deque(maxlen=10)
+        self.pattern_counts = Counter()
         
-        # Load recent transitions
         for transition in self.db.load_transitions():
             self.memory.push(*transition)
         
-        # Game state
         self.move_map = {'r': 0, 'p': 1, 's': 2}
         self.reverse_map = {0: 'r', 1: 'p', 2: 's'}
         self.move_names = {0: 'Rock', 1: 'Paper', 2: 'Scissors'}
@@ -185,26 +233,30 @@ class RPS_AI:
         self.max_rounds = 15
         self.pattern_confidence = 0.0
 
+    def save_model(self, path="rps_model.pth"):
+        torch.save(self.policy_net.state_dict(), path)
+
+    def load_model(self, path="rps_model.pth"):
+        if os.path.exists(path):
+            self.policy_net.load_state_dict(torch.load(path))
+            self.target_net.load_state_dict(self.policy_net.state_dict())
+
     def get_state(self):
         state = np.zeros(self.state_dim)
         human_moves = [human_move for human_move, _ in self.history]
         
-        # Encode pattern frequencies and lengths
         patterns = self.detect_patterns(human_moves)
         for i, (pattern, freq) in enumerate(sorted(patterns.items(), key=lambda x: len(x[0]), reverse=True)[:5]):
             state[i] = freq * 4.0 * self.pattern_confidence
-            state[5 + i] = len(pattern) / 4.0  # Normalize pattern length
+            state[5 + i] = len(pattern) / 4.0
         
-        # Recent moves (weighted)
         for i, (human_move, ai_move) in enumerate(list(self.history)[-5:]):
             state[10 + i] = self.move_map.get(human_move, 0) * (1 + 0.2 * (5 - i))
             state[15 + i] = self.move_map.get(ai_move, 0)
         
-        # Outcomes
         for i, outcome in enumerate(list(self.outcomes)[-5:]):
             state[20 + i] = outcome
         
-        # Ratios and confidence
         if self.round_count > 0:
             state[25] = self.ai_points / self.round_count
             state[26] = self.human_points / self.round_count
@@ -220,7 +272,7 @@ class RPS_AI:
         for length in range(2, 7):
             for i in range(len(moves) - length + 1):
                 pattern = ''.join(moves[i:i+length])
-                weight = 1.0 + 0.7 * (i / len(moves))  # Weight recent patterns
+                weight = 1.0 + 0.7 * (i / len(moves))
                 patterns[pattern] += weight
                 for j in range(i + length, len(moves) - length + 1):
                     if moves[j:j+length] == list(pattern):
@@ -230,14 +282,12 @@ class RPS_AI:
     def predict_next_move(self, moves):
         patterns = self.detect_patterns(moves)
         if not patterns:
-            # Fallback: counter most frequent move
             move_counts = Counter(moves[-6:])
             if move_counts:
                 most_common = move_counts.most_common(1)[0][0]
                 return most_common, 0.3
             return None, 0.0
         
-        # Find the longest pattern matching recent moves
         candidates = [(p, f) for p, f in patterns.items() if moves[-min(len(p), len(moves)):] == list(p)[-min(len(p), len(moves)):]]
         if not candidates:
             return None, 0.0
@@ -263,7 +313,6 @@ class RPS_AI:
                 action = self.move_map['r']
             print(f"Action: Pattern-based ({self.reverse_map[action]})")
             return action
-        # Fallback: counter most frequent move
         human_moves = [hm for hm, _ in list(self.history)[-6:]]
         if human_moves:
             move_counts = Counter(human_moves)
@@ -301,10 +350,13 @@ class RPS_AI:
         patterns = self.detect_patterns(human_moves)
         detected_patterns = list(patterns.keys())
         
-        # Update pattern confidence
-        predicted_move, self.pattern_confidence = self.predict_next_move(human_moves)
+        for pattern in detected_patterns:
+            self.pattern_counts[pattern] += 1
         
-        # Save performance
+        predicted_move, self.pattern_confidence = self.predict_next_move(human_moves)
+        self.pattern_confidence_history.append(self.pattern_confidence)
+        
+        rating = "good" if win_ratio >= 0.7 and tie_ratio <= 0.2 else "neutral" if tie_ratio <= 0.3 else "bad"
         self.db.save_performance(
             game_id=self.game_id,
             win_ratio=win_ratio,
@@ -312,43 +364,65 @@ class RPS_AI:
             detected_patterns=detected_patterns,
             learning_rate=self.learning_rate,
             epsilon=self.epsilon,
-            pattern_reward=self.pattern_reward
+            pattern_reward=self.pattern_reward,
+            rating=rating
         )
         
-        # Log patterns and predictions
+        if rating == "good" and detected_patterns:
+            self.db.re_evaluate_bad_transitions(self.game_id, detected_patterns)
+            self.db.re_evaluate_bad_games(self.game_id, detected_patterns)
+        
         if detected_patterns:
             print(f"Detected patterns: {', '.join(detected_patterns)}")
         if predicted_move:
             print(f"Predicted next human move: {predicted_move} (confidence: {self.pattern_confidence:.2f})")
         
-        # Adjust if performance is poor
-        if tie_ratio > 0.2 or win_ratio < 0.7:
-            self.adjust_parameters(tie_ratio, win_ratio, patterns)
-
-    def adjust_parameters(self, tie_ratio, win_ratio, patterns):
-        if patterns:
-            self.pattern_reward = min(self.pattern_reward + 3.0, 10.0)
-            self.epsilon = max(self.epsilon * 0.2, self.epsilon_min)
-            self.learning_rate = min(self.learning_rate * (1 + 0.5 * self.pattern_confidence), 0.01)
-            print(f"Increased pattern_reward to {self.pattern_reward}, decreased epsilon to {self.epsilon}, learning_rate to {self.learning_rate}")
+        historical_tie_ratio = self.db.get_historical_tie_ratio()
+        tie_threshold = max(0.15, historical_tie_ratio * 1.1)
+        win_threshold = 0.7 - 0.05 * len(detected_patterns) if detected_patterns else 0.7
+        confidence_threshold = 0.5 if len(detected_patterns) <= 2 else 0.4
+        
+        pattern_stagnation = any(self.pattern_counts[pattern] > 5 and self.ai_points / self.round_count < 0.5 for pattern in detected_patterns)
+        high_loss = len(self.loss_history) == 10 and np.mean(self.loss_history) > 1.0
+        
+        stagnation_score = (
+            (1 if tie_ratio > tie_threshold else 0) +
+            (1 if win_ratio < win_threshold else 0) +
+            (1 if len(self.pattern_confidence_history) == 5 and max(self.pattern_confidence_history) < confidence_threshold else 0) +
+            (1 if pattern_stagnation else 0) +
+            (1 if high_loss else 0)
+        )
+        
+        if stagnation_score >= 2:
+            print(f"Stagnation detected (score: {stagnation_score}/5, tie_ratio: {tie_ratio:.2f}/{tie_threshold:.2f}, win_ratio: {win_ratio:.2f}/{win_threshold:.2f}, confidence: {max(self.pattern_confidence_history or [0]):.2f}/{confidence_threshold:.2f}, pattern_stagnation: {pattern_stagnation}, high_loss: {high_loss})")
+            self.adjust_parameters(tie_ratio, win_ratio, patterns, is_stagnant=True, stagnation_score=stagnation_score)
         else:
-            self.pattern_reward = max(self.pattern_reward - 0.5, 0.5)
-            self.epsilon = min(self.epsilon * 1.5, 0.5)
-            self.learning_rate = max(self.learning_rate * 0.8, 0.0001)
-            print(f"Decreased pattern_reward to {self.pattern_reward}, increased epsilon to {self.epsilon}, learning_rate to {self.learning_rate}")
-        
-        # Update optimizer
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.learning_rate)
-        
-        # Clear memory if performance stagnates
-        if tie_ratio > 0.3 and self.round_count > 6:
-            print("Clearing memory due to high tie ratio")
+            self.adjust_parameters(tie_ratio, win_ratio, patterns, is_stagnant=False, stagnation_score=stagnation_score)
+
+    def adjust_parameters(self, tie_ratio, win_ratio, patterns, is_stagnant, stagnation_score):
+        if is_stagnant:
+            self.epsilon = min(self.epsilon * (1.5 + 0.1 * stagnation_score), 0.5)
+            self.learning_rate = max(self.learning_rate * (0.8 - 0.05 * stagnation_score), 0.0001)
+            self.pattern_reward = max(self.pattern_reward - (0.5 + 0.1 * stagnation_score), 0.5)
+            print(f"Stagnation adjustments: Increased epsilon to {self.epsilon}, decreased learning_rate to {self.learning_rate}, pattern_reward to {self.pattern_reward}")
             self.memory = ReplayMemory(self.memory.capacity)
-            self.db.clear_old_games()
+            min_rating = "might_work" if stagnation_score < 4 else "good"
+            for transition in self.db.load_transitions(min_rating=min_rating):
+                self.memory.push(*transition)
+        else:
+            if patterns:
+                self.pattern_reward = min(self.pattern_reward + 3.0, 10.0)
+                self.epsilon = max(self.epsilon * 0.2, self.epsilon_min)
+                self.learning_rate = min(self.learning_rate * (1 + 0.5 * self.pattern_confidence), 0.01)
+                print(f"Patterns detected: Increased pattern_reward to {self.pattern_reward}, decreased epsilon to {self.epsilon}, learning_rate to {self.learning_rate}")
+            else:
+                self.pattern_reward = max(self.pattern_reward - 0.5, 0.5)
+                self.epsilon = min(self.epsilon * 1.5, 0.5)
+                self.learning_rate = max(self.learning_rate * 0.8, 0.0001)
+                print(f"No patterns: Decreased pattern_reward to {self.pattern_reward}, increased epsilon to {self.epsilon}, learning_rate to {self.learning_rate}")
         
-        # Update target network
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.learning_rate)
         self.target_net.load_state_dict(self.policy_net.state_dict())
-        
         self.prev_tie_ratio = tie_ratio
 
     def optimize(self):
@@ -369,6 +443,7 @@ class RPS_AI:
         expected_q_values = rewards + self.gamma * next_q_values * (1 - dones)
         
         loss = nn.MSELoss()(q_values, expected_q_values)
+        self.loss_history.append(loss.item())
         
         self.optimizer.zero_grad()
         loss.backward()
@@ -380,28 +455,23 @@ class RPS_AI:
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
     def play_game(self):
-        # Reset database if previous game had high tie ratio
-        if self.prev_tie_ratio > 0.3:
-            print("Resetting database due to high tie ratio in previous game")
-            self.db.reset_database()
-            self.memory = ReplayMemory(self.memory.capacity)
-        
         print("Rock, Paper, Scissors! Enter 'r', 'p', or 's' to play (q to quit).")
         self.round_count = 0
         self.ai_points = 0
         self.human_points = 0
         self.game_id += 1
+        transition_ids = []
         
         while self.round_count < self.max_rounds:
             state = self.get_state()
             print(f"\nRound {self.round_count + 1}/{self.max_rounds} | AI: {self.ai_points} | Human: {self.human_points}")
             
-            # Wait for human input
             human_move = None
             while human_move not in ['r', 'p', 's']:
                 key = keyboard.read_key(suppress=False)
                 if key == 'q':
                     print("Game terminated.")
+                    self.save_model()
                     self.db.close()
                     return
                 if key in ['r', 'p', 's']:
@@ -410,41 +480,40 @@ class RPS_AI:
                     keyboard.unhook_all()
                     break
             
-            # AI chooses move
             human_moves = [hm for hm, _ in self.history] + [human_move]
             predicted_move, confidence = self.predict_next_move(human_moves)
             ai_action = self.choose_action(state, predicted_move, confidence)
             ai_move = self.reverse_map[ai_action]
             
-            # Determine outcome
             outcome = self.determine_winner(human_move, ai_move)
             reward = outcome
             if predicted_move and confidence >= 0.5 and outcome == 1:
                 reward += self.pattern_reward
             
-            # Update points
+            patterns = self.detect_patterns(human_moves)
+            rating = "good" if reward >= 1 else "neutral" if reward == 0 else "bad"
+            
             if outcome == 1:
                 self.ai_points += 1
             elif outcome == -1:
                 self.human_points += 1
             
-            # Store move history
             self.history.append((human_move, ai_move))
             self.outcomes.append(outcome)
             
-            # Get next state
             next_state = self.get_state()
             done = (self.round_count + 1 == self.max_rounds)
             
-            # Store transition
             self.memory.push(state, ai_action, reward, next_state, done)
-            self.db.save_transition(self.game_id, state, ai_action, reward, next_state, done)
+            self.db.save_transition(self.game_id, state, ai_action, reward, next_state, done, rating, list(patterns.keys()))
+            self.cursor = self.db.conn.cursor()
+            self.cursor.execute('SELECT last_insert_rowid()')
+            transition_id = self.cursor.fetchone()[0]
+            transition_ids.append(transition_id)
             
-            # Optimize and evaluate
             self.optimize()
             self.evaluate_performance()
             
-            # Display moves and result
             print(f"Human: {colored(self.move_names[self.move_map[human_move]], 'blue')}")
             print(f"AI: {colored(self.move_names[ai_action], 'yellow')}")
             if outcome == 1:
@@ -456,7 +525,16 @@ class RPS_AI:
             
             self.round_count += 1
         
-        # Game over
+        if self.round_count >= 2:
+            win_ratio = self.ai_points / self.round_count
+            tie_ratio = (self.round_count - self.ai_points - self.human_points) / self.round_count
+            if win_ratio >= 0.7 and tie_ratio <= 0.2:
+                for tid in transition_ids:
+                    self.db.update_transition_rating(self.game_id, tid, "good")
+            elif tie_ratio > 0.3:
+                for tid in transition_ids:
+                    self.db.update_transition_rating(self.game_id, tid, "bad")
+        
         print(f"\nGame Over! Final Score -> AI: {self.ai_points} | Human: {self.human_points}")
         if self.ai_points > self.human_points:
             print(colored("AI is the overall winner!", 'red'))
@@ -464,6 +542,7 @@ class RPS_AI:
             print(colored("Human is the overall winner!", 'green'))
         else:
             print("The game ends in a tie!")
+        self.save_model()
         self.db.close()
 
 if __name__ == "__main__":
